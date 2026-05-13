@@ -376,4 +376,95 @@ defmodule Sentry.TestTest do
       assert_sentry_log(:info, "pop_sentry_logs test message")
     end
   end
+
+  describe "setup_sentry/1 routes buffered events from allowed processes" do
+    setup do
+      SentryTest.setup_sentry()
+      :ok
+    end
+
+    test "Sentry.Metrics.count/3 from an allowed pid lands in the test's collector" do
+      test_pid = self()
+      done = make_ref()
+
+      pid =
+        spawn(fn ->
+          receive do
+            :go ->
+              Sentry.Metrics.count("allowance.metric.test", 1)
+              send(test_pid, done)
+          end
+        end)
+
+      ref = Process.monitor(pid)
+
+      assert :ok = SentryTest.allow_sentry_reports(self(), pid)
+
+      send(pid, :go)
+      assert_receive ^done, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
+
+      Sentry.TelemetryProcessor.flush()
+      Sentry.TelemetryProcessor.flush(Sentry.TelemetryProcessor)
+
+      metrics = SentryTest.pop_sentry_metrics()
+
+      assert Enum.any?(metrics, &(&1.name == "allowance.metric.test")),
+             "expected the metric emitted from the allowed pid to land in the " <>
+               "test collector, got: #{inspect(metrics)}"
+    end
+  end
+
+  describe "setup_sentry/1 routes buffered logs from allowed processes" do
+    @describetag :capture_log
+
+    setup do
+      ctx = SentryTest.setup_sentry(enable_logs: true, logs: [level: :info])
+
+      handler_name = :"sentry_allow_logs_test_#{System.unique_integer([:positive])}"
+
+      handler_config = %{
+        config: %{
+          enable_logs: true
+        }
+      }
+
+      :ok = :logger.add_handler(handler_name, Sentry.LoggerHandler, handler_config)
+
+      on_exit(fn ->
+        _ = :logger.remove_handler(handler_name)
+      end)
+
+      ctx
+    end
+
+    test "Logger.warning/1 from an allowed pid lands in the test's collector" do
+      require Logger
+
+      test_pid = self()
+      done = make_ref()
+
+      pid =
+        spawn(fn ->
+          receive do
+            :go ->
+              Logger.warning("hello from allowed pid")
+              send(test_pid, done)
+          end
+        end)
+
+      ref = Process.monitor(pid)
+
+      assert :ok = SentryTest.allow_sentry_reports(self(), pid)
+
+      send(pid, :go)
+      assert_receive ^done, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
+
+      Sentry.TelemetryProcessor.flush()
+      Sentry.TelemetryProcessor.flush(Sentry.TelemetryProcessor)
+
+      assert_sentry_log(:warn, "hello from allowed pid")
+    end
+  end
 end

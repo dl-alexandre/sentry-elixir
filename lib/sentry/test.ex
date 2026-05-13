@@ -175,7 +175,8 @@ defmodule Sentry.Test do
     processor_name = :"test_telemetry_processor_#{uid}"
 
     ExUnit.Callbacks.start_supervised!(
-      {Sentry.TelemetryProcessor, name: processor_name},
+      {Sentry.TelemetryProcessor,
+       name: processor_name, processor_resolver: &Sentry.Test.Registry.lookup_processor_for/1},
       id: processor_name
     )
 
