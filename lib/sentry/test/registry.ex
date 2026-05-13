@@ -59,21 +59,18 @@ defmodule Sentry.Test.Registry do
   end
 
   @doc """
-  Removes every routing row whose owner is `owner_pid`. Direct ETS
-  match_delete — atomic, no GenServer round-trip.
+  Ensures `owner_pid` is monitored by the registry so that the
+  `:DOWN` handler runs cleanup (routing-table prune + scope-state
+  erase via `Sentry.Test.Scope.Registry.handle_owner_down/1`) when
+  the owner exits. Idempotent.
 
-  Kept for the case where a scope wants to drop its allowances
-  explicitly (e.g. `Sentry.Test.Scope.Registry.unregister/1`); the
-  `:DOWN` handler also prunes rows automatically when the owner pid
-  exits.
+  Called from `Sentry.Test.Scope.Registry.update/1` on first scope
+  creation so cleanup does not depend on `claim_allow` ever being
+  invoked for this owner.
   """
-  @spec drop_allows_for(pid()) :: :ok
-  def drop_allows_for(owner_pid) when is_pid(owner_pid) do
-    if :ets.whereis(@routing_table) != :undefined do
-      :ets.match_delete(@routing_table, {:_, owner_pid, :_})
-    end
-
-    :ok
+  @spec monitor_owner(pid()) :: :ok
+  def monitor_owner(owner_pid) when is_pid(owner_pid) do
+    GenServer.call(__MODULE__, {:monitor_owner, owner_pid})
   end
 
   @doc """
@@ -173,27 +170,40 @@ defmodule Sentry.Test.Registry do
   @impl true
   def handle_call({:claim_allow, owner_pid, allowed_pid, mode}, _from, state) do
     state = ensure_owner_monitored(state, owner_pid)
-    ensure_scope_owner(owner_pid)
 
     reply =
-      case NimbleOwnership.allow(@ownership_server, owner_pid, allowed_pid, @scope_key) do
+      case ensure_scope_owner(owner_pid) do
+        {:error, {:taken, existing_owner}} ->
+          if mode == :strict, do: {:error, {:taken, existing_owner}}, else: :skipped
+
         :ok ->
-          upsert_owner(allowed_pid, owner_pid)
-          :ok
+          case NimbleOwnership.allow(@ownership_server, owner_pid, allowed_pid, @scope_key) do
+            :ok ->
+              upsert_owner(allowed_pid, owner_pid)
+              :ok
 
-        {:error, %{reason: {:already_allowed, ^owner_pid}}} ->
-          upsert_owner(allowed_pid, owner_pid)
-          :ok
+            {:error, %{reason: {:already_allowed, ^owner_pid}}} ->
+              upsert_owner(allowed_pid, owner_pid)
+              :ok
 
-        {:error, %{reason: {:already_allowed, other}}} ->
-          if mode == :strict, do: {:error, {:taken, other}}, else: :skipped
+            {:error, %{reason: {:already_allowed, other}}} ->
+              if mode == :strict, do: {:error, {:taken, other}}, else: :skipped
 
-        {:error, %{reason: :already_an_owner}} ->
-          # `allowed_pid` is itself a scope owner — treat as a conflict.
-          if mode == :strict, do: {:error, {:taken, allowed_pid}}, else: :skipped
+            {:error, %{reason: :already_an_owner}} ->
+              # `allowed_pid` is itself a scope owner — treat as a conflict.
+              if mode == :strict, do: {:error, {:taken, allowed_pid}}, else: :skipped
+
+            {:error, %{reason: :not_allowed}} ->
+              if mode == :strict, do: {:error, {:taken, allowed_pid}}, else: :skipped
+          end
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call({:monitor_owner, owner_pid}, _from, state) do
+    state = ensure_owner_monitored(state, owner_pid)
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -201,6 +211,8 @@ defmodule Sentry.Test.Registry do
     if :ets.whereis(@routing_table) != :undefined do
       :ets.match_delete(@routing_table, {:_, pid, :_})
     end
+
+    Sentry.Test.Scope.Registry.handle_owner_down(pid)
 
     {:noreply, %{state | owner_monitors: Map.delete(state.owner_monitors, pid)}}
   end
@@ -237,8 +249,14 @@ defmodule Sentry.Test.Registry do
              current -> {:ok, current}
            end
          ) do
-      {:ok, _} -> :ok
-      {:error, _} -> :ok
+      {:ok, _} ->
+        :ok
+
+      {:error, %{reason: {:already_allowed, existing_owner}}} ->
+        {:error, {:taken, existing_owner}}
+
+      {:error, _} ->
+        :ok
     end
   end
 
