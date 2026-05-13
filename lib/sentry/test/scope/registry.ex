@@ -81,8 +81,9 @@ defmodule Sentry.Test.Scope.Registry do
 
   @doc """
   Atomically updates the scope owned by `owner_pid`, creating a new
-  scope on first call and registering cleanup via
-  `ExUnit.Callbacks.on_exit/1`.
+  scope on first call and asking `Sentry.Test.Registry` to monitor
+  the owner pid so cleanup runs from the registry's `:DOWN` handler
+  when the owner exits.
 
   Not concurrency-safe across processes — each test only mutates its
   own scope from its own process, so in practice there is no
@@ -98,7 +99,7 @@ defmodule Sentry.Test.Scope.Registry do
         :error ->
           new_scope = Scope.new(owner_pid)
           bump_counter()
-          register_cleanup(owner_pid)
+          TestRegistry.monitor_owner(owner_pid)
           new_scope
       end
 
@@ -156,14 +157,22 @@ defmodule Sentry.Test.Scope.Registry do
     end
   end
 
-  @spec unregister(pid()) :: :ok
-  def unregister(owner_pid) when is_pid(owner_pid) do
+  @doc """
+  Scope-state half of owner cleanup. Erases the persistent_term scope
+  entry and decrements the active-scope counter. Called from
+  `Sentry.Test.Registry`'s `:DOWN` handler — the routing-table half
+  is pruned there, atomically with monitor-map removal.
+
+  Idempotent: only decrements the counter when the entry was actually
+  present, so duplicate DOWNs cannot drive it negative.
+  """
+  @spec handle_owner_down(pid()) :: :ok
+  def handle_owner_down(owner_pid) when is_pid(owner_pid) do
     case :persistent_term.get({@scope_key, owner_pid}, :__not_set__) do
       :__not_set__ ->
         :ok
 
       %Scope{} ->
-        TestRegistry.drop_allows_for(owner_pid)
         :persistent_term.erase({@scope_key, owner_pid})
         decrement_counter()
         :ok
@@ -308,15 +317,6 @@ defmodule Sentry.Test.Scope.Registry do
       nil -> :ok
       ref -> :counters.sub(ref, 1, 1)
     end
-  end
-
-  defp register_cleanup(owner_pid) do
-    ExUnit.Callbacks.on_exit(fn -> unregister(owner_pid) end)
-  rescue
-    # `on_exit/1` raises outside an ExUnit test process; in that case the
-    # caller is responsible for cleanup (or the scope simply lives until the
-    # owner process dies and `list_active/0` filters it out via `Process.alive?`).
-    _ -> :ok
   end
 
   defp collect_ancestors(_pid, 0, _seen), do: []

@@ -163,21 +163,24 @@ defmodule Sentry.Test do
   def setup_telemetry_processor do
     case Process.get(:sentry_telemetry_processor) do
       name when is_atom(name) and not is_nil(name) ->
-        if processor_alive?(name), do: name, else: do_setup_telemetry_processor()
+        if processor_alive?(name), do: name, else: start_telemetry_processor()
 
       _ ->
-        do_setup_telemetry_processor()
+        start_telemetry_processor()
     end
   end
 
-  defp do_setup_telemetry_processor do
+  defp start_telemetry_processor do
     uid = System.unique_integer([:positive])
     processor_name = :"test_telemetry_processor_#{uid}"
 
     ExUnit.Callbacks.start_supervised!(
-      {Sentry.TelemetryProcessor, name: processor_name},
+      {Sentry.TelemetryProcessor,
+       name: processor_name, processor_resolver: &Sentry.Test.Registry.lookup_processor_for/1},
       id: processor_name
     )
+
+    Process.put(:sentry_telemetry_processor, processor_name)
 
     scheduler_pid = Sentry.TelemetryProcessor.get_scheduler(processor_name)
 
@@ -186,9 +189,9 @@ defmodule Sentry.Test do
       # populates the merged routing ETS row so `Config.namespace/1`
       # resolves the scheduler pid back to this test's scope.
       Sentry.Test.Registry.claim_allow(self(), scheduler_pid, :soft)
+      tag_processor_for_allowed_pid(self(), scheduler_pid)
     end
 
-    Process.put(:sentry_telemetry_processor, processor_name)
     processor_name
   end
 
@@ -844,22 +847,24 @@ defmodule Sentry.Test do
 
     if scheduler_pid do
       Sentry.Test.Registry.claim_allow(self(), scheduler_pid, :soft)
+      tag_processor_for_allowed_pid(self(), scheduler_pid)
     end
 
     # Register cleanup for the collector ETS table only. NimbleOwnership
     # cleans up the key and allowances automatically when this test exits.
     # Drop any worker→processor routing rows that point at this test's
-    # processor so a test that exits before its allowed pids do does not
+    # processor so a test that exits before its allowed pids do not
     # leave stale rows pointing at a stopped per-test processor.
-    processor_name =
-      Process.get(:sentry_telemetry_processor, Sentry.TelemetryProcessor.default_name())
+    processor_name = Process.get(:sentry_telemetry_processor)
 
     ExUnit.Callbacks.on_exit(fn ->
       if :ets.whereis(collector_table) != :undefined do
         :ets.delete(collector_table)
       end
 
-      Sentry.Test.Registry.drop_processor_routing_for(processor_name)
+      if is_atom(processor_name) and not is_nil(processor_name) do
+        Sentry.Test.Registry.drop_processor_routing_for(processor_name)
+      end
     end)
 
     :ok
