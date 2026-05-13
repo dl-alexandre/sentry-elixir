@@ -36,8 +36,8 @@ defmodule Sentry.Application do
       if Config.test_mode?() do
         if Code.ensure_loaded?(NimbleOwnership) do
           [
-            Sentry.Test.Registry,
-            {NimbleOwnership, name: Sentry.Test.OwnershipServer}
+            {NimbleOwnership, name: Sentry.Test.OwnershipServer},
+            Sentry.Test.Registry
           ]
         else
           [Sentry.Test.Registry]
