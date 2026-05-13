@@ -253,7 +253,7 @@ defmodule Sentry.TestTest do
           NimbleOwnership.get_and_update(
             Sentry.Test.OwnershipServer,
             self(),
-            :sentry_test_collector,
+            :sentry_test_scope,
             fn _ -> {:ok, :peer_table} end
           )
 
@@ -262,7 +262,7 @@ defmodule Sentry.TestTest do
             Sentry.Test.OwnershipServer,
             self(),
             target,
-            :sentry_test_collector
+            :sentry_test_scope
           )
 
         send(parent, {:claimed, self()})

@@ -6,9 +6,19 @@ defmodule Sentry.Test.Registry do
   require Logger
 
   # Bypass and Plug.Conn may not be available at compile time (optional deps).
-  @compile {:no_warn_undefined, [Bypass, Bypass.Instance, Bypass.Supervisor, Plug.Conn]}
+  @compile {:no_warn_undefined,
+            [Bypass, Bypass.Instance, Bypass.Supervisor, Plug.Conn, NimbleOwnership]}
 
-  @allows_table :sentry_test_scope_allows
+  @ownership_server Sentry.Test.OwnershipServer
+  @scope_key :sentry_test_scope
+
+  # Single merged ETS table replacing the previous
+  # `:sentry_test_scope_allows` (allowed_pid -> owner_pid) and
+  # `:sentry_test_allowed_pid_processor_routing` (allowed_pid ->
+  # processor_name) tables. Rows are 3-tuples
+  # `{allowed_pid, owner_pid_or_nil, processor_name_or_nil}`. The 3-tuple
+  # shape keeps `:ets.match_delete` patterns simple.
+  @routing_table :sentry_test_pid_routing
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link([] = _opts) do
@@ -22,10 +32,11 @@ defmodule Sentry.Test.Registry do
   end
 
   @doc """
-  Atomic claim of `allowed_pid` for `owner_pid`'s scope. All claims
-  serialize through this GenServer so the conflict check and the ETS
-  write happen as one indivisible step — no two concurrent async tests
-  can both pass a check-and-then-write race for the same allowed_pid.
+  Atomic claim of `allowed_pid` for `owner_pid`'s scope. Backed by
+  `NimbleOwnership.allow/4` against the `:sentry_test_scope` key — the
+  ownership server serializes the conflict check, so two concurrent
+  async tests cannot both pass a check-and-then-write race for the
+  same `allowed_pid`.
 
   `mode`:
     * `:strict` — return `{:error, {:taken, existing_owner}}` when a
@@ -34,10 +45,11 @@ defmodule Sentry.Test.Registry do
     * `:soft`   — return `:skipped` in the same situation (used by the
       auto-allow of globally-supervised pids in `Config.put/1`).
 
-  Stale entries from owners that have exited without cleanup are
-  silently replaced so the new owner can claim the pid.
-
   Idempotent: re-claiming a pid you already own returns `:ok`.
+
+  This routes through the Registry GenServer so that owner monitoring
+  (for ETS row cleanup on owner DOWN) and the cache-row write happen
+  atomically with the NimbleOwnership claim.
   """
   @spec claim_allow(pid(), pid(), :strict | :soft) ::
           :ok | :skipped | {:error, {:taken, pid()}}
@@ -47,14 +59,18 @@ defmodule Sentry.Test.Registry do
   end
 
   @doc """
-  Removes every allow entry whose owner is `owner_pid`. Atomic batch
-  delete via `:ets.match_delete/2` — safe to call from a test's on_exit
-  cleanup without serializing through the GenServer.
+  Removes every routing row whose owner is `owner_pid`. Direct ETS
+  match_delete — atomic, no GenServer round-trip.
+
+  Kept for the case where a scope wants to drop its allowances
+  explicitly (e.g. `Sentry.Test.Scope.Registry.unregister/1`); the
+  `:DOWN` handler also prunes rows automatically when the owner pid
+  exits.
   """
   @spec drop_allows_for(pid()) :: :ok
   def drop_allows_for(owner_pid) when is_pid(owner_pid) do
-    if :ets.whereis(@allows_table) != :undefined do
-      :ets.match_delete(@allows_table, {:_, owner_pid})
+    if :ets.whereis(@routing_table) != :undefined do
+      :ets.match_delete(@routing_table, {:_, owner_pid, :_})
     end
 
     :ok
@@ -68,54 +84,170 @@ defmodule Sentry.Test.Registry do
   """
   @spec lookup_allow_owner(pid()) :: pid() | nil
   def lookup_allow_owner(allowed_pid) when is_pid(allowed_pid) do
-    case :ets.whereis(@allows_table) do
+    case :ets.whereis(@routing_table) do
       :undefined ->
         nil
 
       _ref ->
-        case :ets.lookup(@allows_table, allowed_pid) do
-          [{^allowed_pid, owner}] when is_pid(owner) ->
+        case :ets.lookup(@routing_table, allowed_pid) do
+          [{^allowed_pid, owner, _processor}] when is_pid(owner) ->
             if Process.alive?(owner), do: owner, else: nil
 
-          [] ->
+          _ ->
             nil
         end
     end
   end
 
+  @doc """
+  Tags `allowed_pid` so that buffered events (logs, metrics) emitted
+  from it are routed to `processor_name` rather than the global
+  `Sentry.TelemetryProcessor`. Written by `allow_sentry_reports/2`
+  and consulted by `Sentry.TelemetryProcessor.processor_name/0`.
+
+  Updates the existing routing row's processor field; if no row exists
+  yet (defensive), inserts a row with `nil` owner. Direct ETS write —
+  atomic, no GenServer round-trip.
+  """
+  @spec tag_processor_for(pid(), atom()) :: :ok
+  def tag_processor_for(allowed_pid, processor_name)
+      when is_pid(allowed_pid) and is_atom(processor_name) do
+    if :ets.whereis(@routing_table) != :undefined do
+      unless :ets.update_element(@routing_table, allowed_pid, {3, processor_name}) do
+        :ets.insert(@routing_table, {allowed_pid, nil, processor_name})
+      end
+    end
+
+    :ok
+  end
+
+  @doc """
+  Returns the per-test processor name that should receive buffered
+  events from `allowed_pid`, or `nil` if the pid is not tagged or
+  the routing table is not started (production).
+  """
+  @spec lookup_processor_for(pid()) :: atom() | nil
+  def lookup_processor_for(allowed_pid) when is_pid(allowed_pid) do
+    case :ets.whereis(@routing_table) do
+      :undefined ->
+        nil
+
+      _ ->
+        case :ets.lookup(@routing_table, allowed_pid) do
+          [{^allowed_pid, _owner, processor_name}]
+          when is_atom(processor_name) and not is_nil(processor_name) ->
+            processor_name
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  @doc """
+  Clears the processor field on every routing row that points at
+  `processor_name`. Used by `setup_collector/1`'s `on_exit/1` so a
+  test that exits before its allowed pids do does not leave stale
+  routing rows pointing at a stopped per-test processor. The owner
+  field is preserved so the allow remains intact (subsequent
+  buffered events from those pids fall back to the global
+  processor — matching pre-change behaviour).
+  """
+  @spec drop_processor_routing_for(atom()) :: :ok
+  def drop_processor_routing_for(processor_name) when is_atom(processor_name) do
+    if :ets.whereis(@routing_table) != :undefined do
+      ms = [{{:"$1", :"$2", processor_name}, [], [{{:"$1", :"$2", nil}}]}]
+      _ = :ets.select_replace(@routing_table, ms)
+    end
+
+    :ok
+  end
+
   @impl true
   def init(nil) do
-    _allows_table = :ets.new(@allows_table, [:named_table, :public, :set])
+    _routing_table = :ets.new(@routing_table, [:named_table, :public, :set])
     maybe_start_default_bypass()
-    {:ok, :no_state}
+    {:ok, %{owner_monitors: %{}}}
   end
 
   @impl true
   def handle_call({:claim_allow, owner_pid, allowed_pid, mode}, _from, state) do
+    state = ensure_owner_monitored(state, owner_pid)
+    ensure_scope_owner(owner_pid)
+
     reply =
-      case :ets.lookup(@allows_table, allowed_pid) do
-        [] ->
-          true = :ets.insert_new(@allows_table, {allowed_pid, owner_pid})
+      case NimbleOwnership.allow(@ownership_server, owner_pid, allowed_pid, @scope_key) do
+        :ok ->
+          upsert_owner(allowed_pid, owner_pid)
           :ok
 
-        [{^allowed_pid, ^owner_pid}] ->
+        {:error, %{reason: {:already_allowed, ^owner_pid}}} ->
+          upsert_owner(allowed_pid, owner_pid)
           :ok
 
-        [{^allowed_pid, existing_owner}] ->
-          cond do
-            not Process.alive?(existing_owner) ->
-              true = :ets.insert(@allows_table, {allowed_pid, owner_pid})
-              :ok
+        {:error, %{reason: {:already_allowed, other}}} ->
+          if mode == :strict, do: {:error, {:taken, other}}, else: :skipped
 
-            mode == :strict ->
-              {:error, {:taken, existing_owner}}
-
-            true ->
-              :skipped
-          end
+        {:error, %{reason: :already_an_owner}} ->
+          # `allowed_pid` is itself a scope owner — treat as a conflict.
+          if mode == :strict, do: {:error, {:taken, allowed_pid}}, else: :skipped
       end
 
     {:reply, reply, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    if :ets.whereis(@routing_table) != :undefined do
+      :ets.match_delete(@routing_table, {:_, pid, :_})
+    end
+
+    {:noreply, %{state | owner_monitors: Map.delete(state.owner_monitors, pid)}}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  ## Private helpers
+
+  defp ensure_owner_monitored(%{owner_monitors: monitors} = state, pid) do
+    if Map.has_key?(monitors, pid) do
+      state
+    else
+      ref = Process.monitor(pid)
+      %{state | owner_monitors: Map.put(monitors, pid, ref)}
+    end
+  end
+
+  # Lazily registers `owner_pid` as the NimbleOwnership owner of
+  # `:sentry_test_scope` so subsequent `NimbleOwnership.allow/4` calls
+  # against this owner succeed even when the test never went through
+  # `Sentry.Test.setup_collector/1` (e.g. a test that uses
+  # `Sentry.Test.Config.put/1` standalone). When the owner already
+  # owns the key, the existing metadata is preserved.
+  defp ensure_scope_owner(owner_pid) do
+    case NimbleOwnership.get_and_update(
+           @ownership_server,
+           owner_pid,
+           @scope_key,
+           # Metadata MUST be non-nil so that NimbleOwnership treats
+           # `owner_pid` as a key owner (its `cond` in `allow/4` checks
+           # truthiness of the metadata). Preserve any existing value.
+           fn
+             nil -> {:ok, %{}}
+             current -> {:ok, current}
+           end
+         ) do
+      {:ok, _} -> :ok
+      {:error, _} -> :ok
+    end
+  end
+
+  defp upsert_owner(allowed_pid, owner_pid) do
+    unless :ets.update_element(@routing_table, allowed_pid, {2, owner_pid}) do
+      :ets.insert(@routing_table, {allowed_pid, owner_pid, nil})
+    end
+
+    :ok
   end
 
   # Starts a global Bypass instance that acts as a silent HTTP sink for all tests.
