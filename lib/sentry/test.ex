@@ -230,8 +230,7 @@ defmodule Sentry.Test do
 
   > #### Deprecated {: .warning}
   >
-  > This function is deprecated and will be removed in v13.0.0.
-  > Use `setup_sentry/1` or `start_collecting_sentry_reports/0` instead.
+  > This function is deprecated and will be removed in v14.0.0. Use `setup_sentry/1` instead.
 
   The `:owner`, `:cleanup`, and `:key` options are no longer supported and are ignored.
   """
@@ -252,11 +251,11 @@ defmodule Sentry.Test do
 
   > #### Deprecated {: .warning}
   >
-  > This function is deprecated and will be removed in v13.0.0.
-  > Cleanup is now handled automatically via `on_exit` callbacks.
+  > This function is deprecated and will be removed in v14.0.0.
+  > Cleanup is now handled automatically when the owning test process exits.
   """
   @doc since: "10.2.0"
-  @doc deprecated: "Cleanup is now automatic via on_exit callbacks"
+  @doc deprecated: "Cleanup is now automatic when the owning test process exits"
   @spec cleanup(pid()) :: :ok
   def cleanup(owner_pid) when is_pid(owner_pid) do
     :ok

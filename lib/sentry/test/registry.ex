@@ -167,6 +167,16 @@ defmodule Sentry.Test.Registry do
     {:ok, %{owner_monitors: %{}}}
   end
 
+  # Serialization note: every claim funnels through this single named
+  # GenServer and holds it across TWO blocking round-trips to the
+  # ownership server — `ensure_scope_owner/1`'s
+  # `NimbleOwnership.get_and_update/4` and `NimbleOwnership.allow/4`.
+  # This is the deliberate price of atomicity (no two concurrent async
+  # tests can both pass a check-then-write race for the same
+  # `allowed_pid`). It is acceptable because claims happen at test
+  # setup, not per event, and the hot config/buffer read paths
+  # (`lookup_allow_owner/1`, `lookup_processor_for/1`) bypass this
+  # GenServer with lock-free direct ETS reads.
   @impl true
   def handle_call({:claim_allow, owner_pid, allowed_pid, mode}, _from, state) do
     state = ensure_owner_monitored(state, owner_pid)
@@ -236,6 +246,16 @@ defmodule Sentry.Test.Registry do
   # `Sentry.Test.setup_collector/1` (e.g. a test that uses
   # `Sentry.Test.Config.put/1` standalone). When the owner already
   # owns the key, the existing metadata is preserved.
+  #
+  # INVARIANT: the `:sentry_test_scope` key's metadata is overloaded —
+  # `Sentry.Test.setup_collector/1` stores the per-test collector ETS
+  # table name (an atom) under it, while this function stores a bare
+  # `%{}` marker for collector-less scopes. `Sentry.Test`'s
+  # `owner_collecting?/1` distinguishes the two purely by value type
+  # (atom = collecting, map = not). Therefore the update fun below MUST
+  # preserve an existing value (`current -> {:ok, current}`) and MUST
+  # NOT overwrite it with `%{}`; doing so would silently turn a
+  # collecting scope into a non-collecting one with no type error.
   defp ensure_scope_owner(owner_pid) do
     case NimbleOwnership.get_and_update(
            @ownership_server,
@@ -243,7 +263,8 @@ defmodule Sentry.Test.Registry do
            @scope_key,
            # Metadata MUST be non-nil so that NimbleOwnership treats
            # `owner_pid` as a key owner (its `cond` in `allow/4` checks
-           # truthiness of the metadata). Preserve any existing value.
+           # truthiness of the metadata). Preserve any existing value
+           # (see the INVARIANT above — never clobber a collector atom).
            fn
              nil -> {:ok, %{}}
              current -> {:ok, current}

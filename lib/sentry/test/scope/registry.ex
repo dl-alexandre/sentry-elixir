@@ -7,12 +7,19 @@ defmodule Sentry.Test.Scope.Registry do
   #
   #   * `{:sentry_test_scope, owner_pid} -> %Scope{}` in `:persistent_term` —
   #     one entry per active test scope, owns its overrides.
-  #   * `:sentry_test_scope_allows` ETS table (named, public, set) —
-  #     reverse index `{allowed_pid, owner_pid}` mapping each
-  #     explicitly-routed pid back to the scope that claimed it.
-  #     Owned by `Sentry.Test.Registry`. Direct ETS reads on the config
+  #   * `:sentry_test_pid_routing` ETS table (named, public, set) —
+  #     single merged routing table owned by `Sentry.Test.Registry`.
+  #     Rows are 3-tuples
+  #     `{allowed_pid, owner_pid_or_nil, processor_name_or_nil}`: the
+  #     owner field is the reverse index mapping each explicitly-routed
+  #     pid back to the scope that claimed it (read here via
+  #     `lookup_allow_owner/1`); the processor field routes buffered
+  #     events (logs, metrics) from that pid to a per-test
+  #     `Sentry.TelemetryProcessor`. Direct ETS reads on the config
   #     read path; conflict-checked writes serialize through that
-  #     GenServer for atomic check-and-insert.
+  #     GenServer for atomic check-and-insert. Owner exit is handled by
+  #     that GenServer's `:DOWN` monitor (routing-row prune +
+  #     `handle_owner_down/1`), not `ExUnit.Callbacks.on_exit/1`.
   #   * `@counter_key -> :counters.t()` — atomic counter for cheap
   #     "any active scopes?" short-circuits, so config reads in
   #     production cost essentially nothing.
@@ -29,8 +36,11 @@ defmodule Sentry.Test.Scope.Registry do
   #                     GenServers started via `start_supervised/1`).
   #   3. by_allow     — walk `[pid | ancestors]`; reverse-allow lookup
   #                     for each candidate (the pid was explicitly
-  #                     routed onto a scope via `allow/2` or
-  #                     auto-allowed in `Config.put/1`).
+  #                     routed onto a scope via
+  #                     `Sentry.Test.allow_sentry_reports/2` /
+  #                     `Sentry.Test.Config.allow/2`, or auto-allowed in
+  #                     `Sentry.Test.Config.put/1` — all of which claim
+  #                     through `Sentry.Test.Registry.claim_allow/3`).
   #
   # Globally-supervised processes (`:logger`, `:logger_sup`,
   # `Sentry.Supervisor`) have no caller/ancestor link to any test and
