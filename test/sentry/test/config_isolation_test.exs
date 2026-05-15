@@ -169,4 +169,95 @@ defmodule Sentry.Test.ConfigIsolationTest do
       assert :ok = Sentry.Test.Config.allow(self(), nil)
     end
   end
+
+  describe "config scope isolation across an owner process's lifetime" do
+    test "a worker stops resolving an owner's config once that owner exits" do
+      parent = self()
+      worker = spawn_env_probe()
+      on_exit(fn -> Process.exit(worker, :kill) end)
+
+      owner =
+        spawn(fn ->
+          Sentry.Test.Config.put(environment_name: "owner_a_env")
+          :ok = Sentry.Test.Config.allow(self(), worker)
+          send(parent, :allowed)
+
+          receive do
+            :exit -> :ok
+          end
+        end)
+
+      assert_receive :allowed, 1_000
+
+      assert env_of(worker) == "owner_a_env"
+
+      ref = Process.monitor(owner)
+      send(owner, :exit)
+      assert_receive {:DOWN, ^ref, :process, ^owner, _}, 1_000
+
+      assert wait_until(fn -> env_of(worker) != "owner_a_env" end)
+    end
+
+    test "a worker freed by a finished owner can be reclaimed and rebound by a new owner" do
+      parent = self()
+      worker = spawn_env_probe()
+      on_exit(fn -> Process.exit(worker, :kill) end)
+
+      first_owner =
+        spawn(fn ->
+          Sentry.Test.Config.put(environment_name: "first_owner_env")
+          :ok = Sentry.Test.Config.allow(self(), worker)
+          send(parent, :claimed)
+
+          receive do
+            :exit -> :ok
+          end
+        end)
+
+      assert_receive :claimed, 1_000
+      assert env_of(worker) == "first_owner_env"
+
+      assert_raise Scope.AllowConflictError, fn ->
+        Sentry.Test.Config.allow(self(), worker)
+      end
+
+      ref = Process.monitor(first_owner)
+      send(first_owner, :exit)
+      assert_receive {:DOWN, ^ref, :process, ^first_owner, _}, 1_000
+
+      put_test_config(environment_name: "second_owner_env")
+
+      assert wait_until(fn ->
+               try do
+                 Sentry.Test.Config.allow(self(), worker) == :ok
+               rescue
+                 Scope.AllowConflictError -> false
+               end
+             end)
+
+      assert env_of(worker) == "second_owner_env"
+    end
+  end
+
+  defp spawn_env_probe do
+    spawn(fn -> env_probe_loop() end)
+  end
+
+  defp env_probe_loop do
+    receive do
+      {:env?, reply_to} ->
+        send(reply_to, {:env, Sentry.Config.environment_name()})
+        env_probe_loop()
+    end
+  end
+
+  defp env_of(probe) do
+    send(probe, {:env?, self()})
+
+    receive do
+      {:env, env} -> env
+    after
+      100 -> :no_reply
+    end
+  end
 end
